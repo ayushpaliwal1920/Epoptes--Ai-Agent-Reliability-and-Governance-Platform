@@ -1,0 +1,533 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
+from app.db.database import get_db
+from app.db.model import (
+    Agent,
+    AgentRun,
+    AgentScope,
+    SecurityEvent,
+    SecurityScanResult
+)
+
+from app.api.dependencies import (
+    get_current_user,
+    get_current_agent
+)
+
+from app.services.security.engine import SecurityEngine
+from app.services.security.event_manager import SecurityEventManager
+
+from app.schemas.security import SecurityScanRequest
+
+from app.services.security.scope_checker import ScopeChecker
+from app.schemas.security import AuthorizationRequest
+from app.db.model import AgentScope
+
+from datetime import datetime, timedelta, timezone
+
+router = APIRouter(
+    prefix="/api/v1/security",
+    tags=["Security"]
+)
+
+engine = SecurityEngine()
+event_manager = SecurityEventManager()
+
+
+def serialize_scan(result):
+
+    return {
+        "passed": result["passed"],
+        "blocked": result["blocked"],
+        "risk_level": result["risk_level"],
+        "findings": result["findings"]
+    }
+
+
+
+@router.post("/scan")
+def scan_content(
+    payload: SecurityScanRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent)
+):
+
+    # 1. Validate run ownership.
+    if payload.run_id is not None:
+
+        run = db.query(AgentRun).filter(
+            AgentRun.id == payload.run_id,
+            AgentRun.agent_id == agent.id,
+            AgentRun.organization_id == agent.organization_id
+        ).first()
+
+        if not run:
+            raise HTTPException(
+                status_code=404,
+                detail="Run not found for this agent"
+            )
+
+    # 2. Perform security scanning.
+    result = engine.scan_content(
+        content=payload.content,
+        scan_type=payload.scan_type
+    )
+
+    try:
+
+        # 3. Add security events to the current transaction.
+        events = event_manager.record_findings(
+            db=db,
+            organization_id=agent.organization_id,
+            agent_id=agent.id,
+            run_id=payload.run_id,
+            findings=result["findings"],
+            original_content=payload.content
+        )
+
+        # 4. Add the scan result to the same transaction.
+        scan_record = SecurityScanResult(
+            organization_id=agent.organization_id,
+            agent_id=agent.id,
+            run_id=payload.run_id,
+            scan_type=payload.scan_type,
+            risk_level=result["risk_level"],
+            passed=result["passed"],
+            findings=result["findings"]
+        )
+
+        db.add(scan_record)
+
+        # 5. Commit both events and scan result together.
+        db.commit()
+
+        # 6. Prepare the API response.
+        response = serialize_scan(result)
+
+        response["event_ids"] = [
+            event.id for event in events
+        ]
+
+        response["scan_id"] = scan_record.id
+
+        return response
+
+    except Exception:
+        # If any database operation fails, undo the transaction.
+        db.rollback()
+        raise
+
+
+@router.get("/events")
+def list_security_events(
+    severity: str | None = None,
+    event_type: str | None = None,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+
+    query = db.query(SecurityEvent).filter(
+        SecurityEvent.organization_id ==
+        current_user.organization_id
+    )
+
+    if severity:
+        query = query.filter(
+            SecurityEvent.severity == severity
+        )
+
+    if event_type:
+        query = query.filter(
+            SecurityEvent.event_type == event_type
+        )
+
+    return query.order_by(
+        SecurityEvent.created_at.desc()
+    ).limit(100).all()
+
+
+@router.get("/events/{event_id}")
+def get_security_event(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+
+    event = db.query(SecurityEvent).filter(
+        SecurityEvent.id == event_id,
+        SecurityEvent.organization_id ==
+        current_user.organization_id
+    ).first()
+
+    if not event:
+        raise HTTPException(
+            status_code=404,
+            detail="Security event not found"
+        )
+
+    return event
+
+
+@router.get("/agents/{agent_id}/security-summary")
+def get_agent_security_summary(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+
+    agent = db.query(Agent).filter(
+        Agent.id == agent_id,
+        Agent.organization_id == current_user.organization_id
+    ).first()
+
+    if not agent:
+        raise HTTPException(
+            status_code=404,
+            detail="Agent not found"
+        )
+
+    events = db.query(SecurityEvent).filter(
+        SecurityEvent.agent_id == agent_id,
+        SecurityEvent.organization_id ==
+        current_user.organization_id
+    )
+
+    total = events.count()
+
+    critical = events.filter(
+        SecurityEvent.severity == "critical"
+    ).count()
+
+    high = events.filter(
+        SecurityEvent.severity == "high"
+    ).count()
+
+    blocked = events.filter(
+        SecurityEvent.blocked == True
+    ).count()
+
+    open_events = events.filter(
+        SecurityEvent.status == "open"
+    ).count()
+
+    return {
+        "agent_id": agent_id,
+        "total_events": total,
+        "critical_events": critical,
+        "high_events": high,
+        "blocked_events": blocked,
+        "open_events": open_events
+    }
+
+
+
+@router.post("/authorize")
+def authorize_operation(
+    payload: AuthorizationRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """
+    Authorize an agent operation.
+
+    Enforces:
+    - Agent scope permissions
+    - Requests-per-minute limit
+    - Tool calls per run
+    - Run ownership validation
+
+    Records both allowed and denied decisions.
+    """
+
+    # -------------------------------------------------
+    # 1. Validate run ownership
+    # -------------------------------------------------
+
+    run = None
+
+    if payload.run_id is not None:
+        run = db.query(AgentRun).filter(
+            AgentRun.id == payload.run_id,
+            AgentRun.agent_id == agent.id,
+            AgentRun.organization_id == agent.organization_id,
+        ).first()
+
+        if not run:
+            raise HTTPException(
+                status_code=404,
+                detail="Run not found for this agent",
+            )
+
+    # -------------------------------------------------
+    # 2. Lock the agent scope row
+    # -------------------------------------------------
+
+    # PostgreSQL row locking serializes authorization
+    # checks for this agent across concurrent requests.
+    scope = db.query(AgentScope).filter(
+        AgentScope.agent_id == agent.id,
+        AgentScope.organization_id == agent.organization_id,
+    ).with_for_update().first()
+
+    # -------------------------------------------------
+    # 3. Audit event helper
+    # -------------------------------------------------
+
+    def record_decision(
+        event_type,
+        severity,
+        description,
+        blocked,
+        metadata=None,
+    ):
+        event = SecurityEvent(
+            organization_id=agent.organization_id,
+            agent_id=agent.id,
+            run_id=payload.run_id,
+            event_type=event_type,
+            severity=severity,
+            status="open",
+            description=description,
+            detection_method="scope_authorization",
+            blocked=blocked,
+            metadata_json=metadata or {},
+        )
+
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+
+        return event
+
+    operation_metadata = {
+        "tool_name": payload.tool_name,
+        "action": payload.action,
+        "resource": payload.resource,
+        "run_id": payload.run_id,
+    }
+
+    # -------------------------------------------------
+    # 4. Deny if scope is missing or disabled
+    # -------------------------------------------------
+
+    if not scope or not scope.enabled:
+
+        reason = "Agent scope missing or disabled"
+
+        event = record_decision(
+            event_type="TOOL_AUTHORIZATION_DENIED",
+            severity="high",
+            description=reason,
+            blocked=True,
+            metadata={
+                **operation_metadata,
+                "reason": reason,
+            },
+        )
+
+        return {
+            "authorized": False,
+            "agent_id": agent.id,
+            "reason": reason,
+            "event_id": event.id,
+        }
+
+    # -------------------------------------------------
+    # 5. Read configured resource limits
+    # -------------------------------------------------
+
+    resource_limits = scope.resource_limits or {}
+
+    max_requests_per_minute = resource_limits.get(
+        "max_requests_per_minute",
+        60,
+    )
+
+    max_tool_calls_per_run = resource_limits.get(
+        "max_tool_calls_per_run",
+        20,
+    )
+
+    now = datetime.now(timezone.utc)
+    one_minute_ago = now - timedelta(minutes=1)
+
+    authorization_event_types = [
+        "TOOL_AUTHORIZATION_ALLOWED",
+        "TOOL_AUTHORIZATION_DENIED",
+        "TOOL_RUN_LIMIT_EXCEEDED",
+    ]
+
+    # -------------------------------------------------
+    # 6. Enforce requests-per-minute limit
+    # -------------------------------------------------
+
+    recent_requests = db.query(
+        func.count(SecurityEvent.id)
+    ).filter(
+        SecurityEvent.organization_id == agent.organization_id,
+        SecurityEvent.agent_id == agent.id,
+        SecurityEvent.event_type.in_(
+            authorization_event_types
+        ),
+        SecurityEvent.created_at >= one_minute_ago,
+    ).scalar() or 0
+
+    if recent_requests >= max_requests_per_minute:
+
+        reason = (
+            "Agent exceeded its requests-per-minute limit"
+        )
+
+        event = record_decision(
+            event_type="TOOL_RATE_LIMIT_EXCEEDED",
+            severity="high",
+            description=reason,
+            blocked=True,
+            metadata={
+                **operation_metadata,
+                "limit": max_requests_per_minute,
+                "observed_requests": recent_requests,
+            },
+        )
+
+        return {
+            "authorized": False,
+            "agent_id": agent.id,
+            "reason": reason,
+            "event_id": event.id,
+        }
+
+    # -------------------------------------------------
+    # 7. Enforce tool calls per run
+    # -------------------------------------------------
+
+    if payload.run_id is not None:
+
+        successful_tool_calls = db.query(
+            func.count(SecurityEvent.id)
+        ).filter(
+            SecurityEvent.organization_id == agent.organization_id,
+            SecurityEvent.agent_id == agent.id,
+            SecurityEvent.run_id == payload.run_id,
+            SecurityEvent.event_type == (
+                "TOOL_AUTHORIZATION_ALLOWED"
+            ),
+        ).scalar() or 0
+
+        if successful_tool_calls >= max_tool_calls_per_run:
+
+            reason = (
+                "Agent exceeded its maximum tool calls for this run"
+            )
+
+            event = record_decision(
+                event_type="TOOL_RUN_LIMIT_EXCEEDED",
+                severity="high",
+                description=reason,
+                blocked=True,
+                metadata={
+                    **operation_metadata,
+                    "limit": max_tool_calls_per_run,
+                    "observed_tool_calls": successful_tool_calls,
+                },
+            )
+
+            return {
+                "authorized": False,
+                "agent_id": agent.id,
+                "reason": reason,
+                "event_id": event.id,
+            }
+
+    # -------------------------------------------------
+    # 8. Build scope data
+    # -------------------------------------------------
+
+    scope_data = {
+        "enabled": scope.enabled,
+        "allowed_tools": scope.allowed_tools or [],
+        "allowed_actions": scope.allowed_actions or [],
+        "restricted_actions": scope.restricted_actions or [],
+        "allowed_resources": scope.allowed_resources or [],
+        "allowed_topics": scope.allowed_topics or [],
+        "resource_limits": resource_limits,
+    }
+
+    # -------------------------------------------------
+    # 9. Check all required permissions
+    # -------------------------------------------------
+
+    checks = [
+        ScopeChecker.check_tool_permission(
+            scope_data,
+            payload.tool_name,
+        ),
+        ScopeChecker.check_action_permission(
+            scope_data,
+            payload.action,
+        ),
+        ScopeChecker.check_resource_permission(
+            scope_data,
+            payload.resource,
+        ),
+    ]
+
+    requires_amount = ScopeChecker.requires_transaction_amount(
+        payload.action
+    )
+
+    if requires_amount or payload.transaction_amount is not None:
+        checks.append(
+            ScopeChecker.check_transaction_limit(
+                scope_data,
+                payload.transaction_amount,
+            )
+        )
+
+    authorized = all(
+        result["allowed"]
+        for result in checks
+    )
+
+    reason = (
+        "All permission checks passed"
+        if authorized
+        else "One or more permission checks failed"
+    )
+
+    # -------------------------------------------------
+    # 10. Record authorization decision
+    # -------------------------------------------------
+
+    event_type = (
+        "TOOL_AUTHORIZATION_ALLOWED"
+        if authorized
+        else "TOOL_AUTHORIZATION_DENIED"
+    )
+
+    event = record_decision(
+        event_type=event_type,
+        severity="info" if authorized else "medium",
+        description=reason,
+        blocked=not authorized,
+        metadata={
+            **operation_metadata,
+            "authorized": authorized,
+            "checks": checks,
+        },
+    )
+
+    # -------------------------------------------------
+    # 11. Return decision
+    # -------------------------------------------------
+
+    return {
+        "authorized": authorized,
+        "agent_id": agent.id,
+        "run_id": payload.run_id,
+        "checks": checks,
+        "reason": reason,
+        "event_id": event.id,
+    }

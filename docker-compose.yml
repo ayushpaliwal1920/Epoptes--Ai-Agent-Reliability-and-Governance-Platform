@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: epoptes-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: epoptes
+      POSTGRES_PASSWORD: epoptes_dev_password
+      POSTGRES_DB: epoptes
+    ports:
+      - "5432:5432"
+    volumes:
+      - epoptes_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U epoptes -d epoptes"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  epoptes_data:

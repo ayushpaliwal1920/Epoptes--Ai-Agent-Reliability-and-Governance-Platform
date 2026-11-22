@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentguard-sdk"
+version = "0.1.0"
+description = "Python SDK for AgentGuard"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agentguard*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["../backend"]
+asyncio_default_fixture_loop_scope = "function"
